@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "alarawms.obsidian-voice",
+  "name": "Obsidian Voice Capture",
+  "version": "1.0.0",
+  "author": "alarawms",
+  "license": "MIT",
+  "description": "Press SUPER+SHIFT+V (or click the bar icon) to record; press again to stop. Transcribes locally with Omarchy's voxtype engine and files the note straight into your Obsidian vault: appended to today's daily note and saved as its own note in Inbox/.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Obsidian Voice Capture",
+    "description": "Microphone icon: click to start/stop a voice capture that gets transcribed and filed into your Obsidian vault.",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "alwaysShow": true
+    },
+    "schema": [
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Show the microphone icon while idle",
+        "defaultValue": true
+      }
+    ]
+  }
+}

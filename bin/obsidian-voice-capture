@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# Obsidian Voice Capture — push-a-key-twice voice notes filed straight into
+# an Obsidian vault, transcribed locally with Omarchy's voxtype (whisper.cpp).
+#
+#   obsidian-voice-capture start            begin recording
+#   obsidian-voice-capture stop             stop, transcribe, file the note
+#   obsidian-voice-capture toggle           start if idle, stop if recording
+#   obsidian-voice-capture cancel           stop and discard, no transcript
+#   obsidian-voice-capture status [--json]  print current state
+#
+# Config: ~/.config/obsidian-voice/config.json (created with defaults on first run)
+# Runtime state: $XDG_RUNTIME_DIR/obsidian-voice/{status.json,rec.pid,rec.wav}
+set -euo pipefail
+
+SCRIPT=$(readlink -f "$0")
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/obsidian-voice"
+CONFIG="$CONFIG_DIR/config.json"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp}/obsidian-voice"
+STATUS="$RUNTIME_DIR/status.json"
+PIDFILE="$RUNTIME_DIR/rec.pid"
+WAV="$RUNTIME_DIR/rec.wav"
+
+mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR"
+
+# ---------- config ----------
+default_config() {
+  jq -n '{
+    vault: "",
+    dailyDir: "daily",
+    inboxDir: "Inbox",
+    dailyHeading: "## Voice Notes",
+    filingMode: "both",
+    model: "",
+    language: "auto",
+    maxDurationSecs: 300,
+    keepAudio: false
+  }'
+}
+
+[[ -f "$CONFIG" ]] || default_config > "$CONFIG"
+
+cfg() {
+  # cfg <key> <default>
+  jq -r --arg k "$1" --arg d "$2" '.[$k] // $d' "$CONFIG"
+}
+
+VAULT=$(cfg vault "")
+DAILY_DIR=$(cfg dailyDir "daily")
+INBOX_DIR=$(cfg inboxDir "Inbox")
+HEADING=$(cfg dailyHeading "## Voice Notes")
+FILING_MODE=$(cfg filingMode "both")
+MODEL=$(cfg model "")
+LANGUAGE=$(cfg language "auto")
+MAX_DURATION=$(cfg maxDurationSecs "300")
+KEEP_AUDIO=$(cfg keepAudio "false")
+
+# ---------- helpers ----------
+notify() {
+  local title="$1" body="$2"
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send "$title" "$body" >/dev/null 2>&1 || true
+  else
+    notify-send "$title" "$body" >/dev/null 2>&1 || true
+  fi
+}
+
+write_status() {
+  # write_status <state> [error]
+  local state="$1" error="${2:-}"
+  local last="null"
+  if [[ -f "$RUNTIME_DIR/last.json" ]]; then
+    last=$(cat "$RUNTIME_DIR/last.json")
+  fi
+  jq -n --arg state "$state" --arg error "$error" --argjson last "$last" \
+    '{state: $state, error: $error, last: $last, updatedAt: now}' > "$STATUS.tmp"
+  mv "$STATUS.tmp" "$STATUS"
+}
+
+recording_pid() {
+  [[ -f "$PIDFILE" ]] || return 1
+  local pid; pid=$(cat "$PIDFILE" 2>/dev/null || true)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && echo "$pid" && return 0
+  return 1
+}
+
+is_recording() { recording_pid >/dev/null; }
+
+require_vault() {
+  if [[ -z "$VAULT" ]]; then
+    notify "Voice capture — not configured" "Set \"vault\" in $CONFIG to your Obsidian vault path"
+    echo "error: set \"vault\" in $CONFIG to your Obsidian vault path" >&2
+    exit 1
+  fi
+  if [[ ! -d "$VAULT" ]]; then
+    notify "Voice capture — vault not found" "$VAULT (check \"vault\" in $CONFIG)"
+    echo "error: vault directory not found: $VAULT" >&2
+    exit 1
+  fi
+}
+
+# ---------- recording ----------
+cmd_start() {
+  require_vault
+  if is_recording; then
+    notify "Voice capture" "Already recording"
+    return 0
+  fi
+  rm -f "$WAV"
+  pw-record --channels=1 --rate=16000 --format=s16 "$WAV" \
+    >"$RUNTIME_DIR/pw-record.log" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
+  disown "$pid" 2>/dev/null || true
+  # Safety net: auto-stop a forgotten recording after maxDurationSecs.
+  ( sleep "$MAX_DURATION"; kill -0 "$pid" 2>/dev/null && "$SCRIPT" stop >/dev/null 2>&1 ) &
+  disown $! 2>/dev/null || true
+  write_status "recording"
+  notify "Voice capture" "Recording… press again to stop"
+}
+
+cmd_cancel() {
+  local pid
+  if pid=$(recording_pid); then
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  fi
+  rm -f "$PIDFILE" "$WAV"
+  write_status "idle"
+  notify "Voice capture" "Discarded"
+}
+
+cmd_stop() {
+  local pid
+  if ! pid=$(recording_pid); then
+    notify "Voice capture" "Not recording"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  rm -f "$PIDFILE"
+
+  if [[ ! -s "$WAV" ]]; then
+    write_status "idle"
+    notify "Voice capture" "No audio recorded"
+    return 0
+  fi
+
+  local wav_size; wav_size=$(stat -c%s "$WAV" 2>/dev/null || echo 0)
+  if (( wav_size < 4096 )); then
+    rm -f "$WAV"
+    write_status "idle"
+    notify "Voice capture" "Recording too short — discarded"
+    return 0
+  fi
+
+  write_status "transcribing"
+  notify "Voice capture" "Transcribing…"
+
+  local raw transcript rc
+  local -a voxtype_args=(-q)
+  [[ -n "$MODEL" ]] && voxtype_args+=(--model "$MODEL")
+  [[ -n "$LANGUAGE" ]] && voxtype_args+=(--language "$LANGUAGE")
+  set +e
+  raw=$(voxtype "${voxtype_args[@]}" transcribe "$WAV" 2>"$RUNTIME_DIR/voxtype.err")
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    local err_line
+    err_line=$(tail -n1 "$RUNTIME_DIR/voxtype.err" 2>/dev/null || echo "voxtype failed")
+    write_status "error" "$err_line"
+    notify "Voice capture failed" "$err_line"
+    return 1
+  fi
+
+  transcript=$(awk '
+    /^Processing .*samples/ { found=1; next }
+    found && NF { if (out != "") out = out " " $0; else out = $0 }
+    END { print out }
+  ' <<<"$raw")
+
+  if [[ "$KEEP_AUDIO" != "true" ]]; then
+    rm -f "$WAV"
+  fi
+
+  if [[ -z "$transcript" ]]; then
+    write_status "idle"
+    notify "Voice capture" "No speech detected"
+    return 0
+  fi
+
+  file_capture "$transcript"
+}
+
+cmd_toggle() {
+  if is_recording; then cmd_stop; else cmd_start; fi
+}
+
+# ---------- filing into the Obsidian vault ----------
+file_capture() {
+  local text="$1"
+  local now_date now_time now_stamp now_iso
+  now_date=$(date +%F)
+  now_time=$(date +%H:%M)
+  now_stamp=$(date +%Y%m%d-%H%M%S)
+  now_iso=$(date -Iseconds)
+
+  mkdir -p "$VAULT/$DAILY_DIR" "$VAULT/$INBOX_DIR"
+
+  local note_basename="Voice Capture $now_stamp"
+  local note_file="$note_basename.md"
+  local note_path="$VAULT/$INBOX_DIR/$note_file"
+  local daily_path="$VAULT/$DAILY_DIR/$now_date.md"
+  local note_path_rel="" daily_path_rel=""
+
+  if [[ "$FILING_MODE" == "atomic" || "$FILING_MODE" == "both" ]]; then
+    {
+      printf -- '---\n'
+      printf 'tags: [voice-capture]\n'
+      printf 'created: %s\n' "$now_iso"
+      printf 'source: voice\n'
+      printf -- '---\n\n'
+      printf '%s\n' "$text"
+    } > "$note_path"
+    note_path_rel="$INBOX_DIR/$note_file"
+  fi
+
+  if [[ "$FILING_MODE" == "daily" || "$FILING_MODE" == "both" ]]; then
+    [[ -f "$daily_path" ]] || printf '# %s\n' "$now_date" > "$daily_path"
+
+    local link=""
+    [[ -n "$note_path_rel" ]] && link=" ([[${note_basename}|${now_time}]])"
+    local bullet="- ${now_time} — ${text}${link}"
+
+    if grep -qxF "$HEADING" "$daily_path"; then
+      awk -v h="$HEADING" -v b="$bullet" '
+        { print }
+        $0 == h && !done { print b; done=1 }
+      ' "$daily_path" > "$daily_path.tmp"
+      mv "$daily_path.tmp" "$daily_path"
+    else
+      printf '\n%s\n%s\n' "$HEADING" "$bullet" >> "$daily_path"
+    fi
+    daily_path_rel="$DAILY_DIR/$now_date.md"
+  fi
+
+  jq -n --arg text "$text" --arg ts "$now_iso" \
+        --arg notePath "$note_path_rel" --arg dailyPath "$daily_path_rel" \
+        --arg vault "$VAULT" \
+        '{text: $text, ts: $ts, notePath: $notePath, dailyPath: $dailyPath, vault: $vault}' \
+    > "$RUNTIME_DIR/last.json"
+
+  write_status "idle"
+
+  local snippet="$text"
+  (( ${#snippet} > 140 )) && snippet="${snippet:0:140}…"
+  local where=""
+  [[ -n "$daily_path_rel" ]] && where="daily note"
+  if [[ -n "$note_path_rel" ]]; then
+    [[ -n "$where" ]] && where="$where + Inbox" || where="Inbox"
+  fi
+  notify "Voice capture saved · $where" "$snippet"
+}
+
+cmd_status() {
+  [[ -f "$STATUS" ]] || write_status "idle"
+  if [[ "${1:-}" == "--json" ]]; then
+    cat "$STATUS"
+  else
+    jq -r '"\(.state)" + (if .error != "" then " — " + .error else "" end)' "$STATUS"
+  fi
+}
+
+case "${1:-status}" in
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  toggle) cmd_toggle ;;
+  cancel) cmd_cancel ;;
+  status) cmd_status "${2:-}" ;;
+  *) echo "usage: obsidian-voice-capture {start|stop|toggle|cancel|status [--json]}" >&2; exit 2 ;;
+esac
