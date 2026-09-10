@@ -22,6 +22,7 @@ widget disabled too — a bash CLI does all the actual work.
   Settings → Voxtype)
 - `pw-record` (PipeWire — ships with Omarchy)
 - `jq`
+- `xdg-open` (only for the popup's "Open vault" / "Open config" buttons — ships with most desktops)
 - An existing Obsidian vault
 
 ## Install
